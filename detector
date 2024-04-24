@@ -1,0 +1,185 @@
+import numpy as np
+from scipy.ndimage import gaussian_filter
+from scipy.spatial.distance import cdist
+from skimage.measure import label, regionprops
+from skimage.feature import peak_local_max
+from tifffile import imread
+import os
+import pandas as pd
+import matplotlib.pyplot as plt
+from IPython.display import display, Image
+
+output_pathway = 'results.xlsx'
+
+def compute_gaussian_puncta_probability(image, sigma=3):
+    smoothed_image = gaussian_filter(image, sigma=sigma)
+    return smoothed_image
+
+def count_puncta(image, threshold=0):
+    labeled_image = label(image > threshold)
+    regions = regionprops(labeled_image)
+    num_puncta = len(regions)
+    return regions
+#Funtion to calculate average size of puncta
+def calculate_average_blob_size(regions):
+    areas = [region.area for region in regions]
+    average_area = np.mean(areas)
+    average_diameter = np.sqrt(4 * average_area / np.pi)
+    return average_diameter
+
+def safe_delete(arr, indices, axis=0):
+    indices = np.array(indices)
+    valid_indices = indices < arr.shape[axis]
+    if np.any(valid_indices):
+        arr = np.delete(arr, indices[valid_indices], axis=axis)
+    return arr
+
+def detect_synapses(presynaptic, microglial, postsynaptic, threshold=0):
+# Step 1: Compute Gaussian puncta probability
+    pre_gaussian_prob = compute_gaussian_puncta_probability(presynaptic)
+    micro_gaussian_prob = compute_gaussian_puncta_probability(microglial)
+    post_gaussian_prob = compute_gaussian_puncta_probability(postsynaptic)
+
+    #fig, axs = plt.subplots(1, 3, figsize=(12, 3),)
+    #axs[0].imshow(pre_gaussian_prob, cmap='Reds')
+    #axs[0].set_title('Presynaptic Gaussian Smoothed')
+    #axs[1].imshow(micro_gaussian_prob, cmap='Greens')
+    #axs[1].set_title('Microglial Gaussian Smoothed')
+    #axs[2].imshow(post_gaussian_prob, cmap='Blues')
+    #axs[2].set_title('Postsynaptic Gaussian Smoothed')
+    #plt.savefig(f'smoothing_{well_number}_{set_number}.png', dpi=200)
+    #plt.show()
+# Step 2: Count puncta in each image and calculate average blob size
+    pre_regions = count_puncta(pre_gaussian_prob)
+    micro_regions = count_puncta(micro_gaussian_prob)
+    post_regions = count_puncta(post_gaussian_prob)
+    average_pre_blob_size = calculate_average_blob_size(pre_regions)
+    average_micro_blob_size = calculate_average_blob_size(micro_regions)
+    average_post_blob_size = calculate_average_blob_size(post_regions)
+    min_distance_pre = int(average_pre_blob_size)
+    min_distance_micro = int(average_micro_blob_size)
+    min_distance_post = int(average_post_blob_size)
+    min_distance_prepost = int(max(average_pre_blob_size, average_post_blob_size))
+    min_distance_premicro = int(max(average_pre_blob_size, average_micro_blob_size))
+    min_distance_postmicro = int(max(average_post_blob_size, average_micro_blob_size))
+
+# Step 3: Find local maxima (potential synapse locations) in presynaptic, microglial, and postsynaptic images
+    pre_maxima = peak_local_max(pre_gaussian_prob, min_distance=min_distance_pre, threshold_abs=threshold)
+    micro_maxima = peak_local_max(micro_gaussian_prob, min_distance=min_distance_micro, threshold_abs=threshold)
+    post_maxima = peak_local_max(post_gaussian_prob, min_distance=min_distance_post, threshold_abs=threshold)
+
+# Step 4: Compute pairwise distances between potential synapse locations in presynaptic, microglial, and postsynaptic images
+    pre_micro_distances = cdist(pre_maxima, micro_maxima)
+    pre_post_distances = cdist(pre_maxima, post_maxima)
+    micro_post_distances = cdist(micro_maxima, post_maxima)
+
+# Step 5: Count triple colocalizations
+    num_colocalized_synapses = 0
+    colocalized_synapse_indices = []  # Initialize the list to store indices of colocalized synapses for the matplot
+    for i in range(min(len(pre_maxima), len(pre_micro_distances), len(micro_post_distances))):
+        if len(pre_micro_distances[i]) > 0 and len(micro_post_distances[i]) > 0:
+          if i < len(pre_micro_distances) and i < len(micro_post_distances):
+            if np.min(pre_micro_distances[i]) <= min_distance_premicro and np.min(micro_post_distances[i]) <= min_distance_postmicro:
+                num_colocalized_synapses += 1
+                colocalized_synapse_indices.append(i)  # Store the index of colocalized synapses for the matplot
+    if colocalized_synapse_indices:
+      pre_micro_distances = safe_delete(pre_micro_distances, colocalized_synapse_indices, axis=0)
+      micro_post_distances = safe_delete(micro_post_distances, colocalized_synapse_indices, axis=0)
+      pre_post_distances = safe_delete(pre_post_distances, colocalized_synapse_indices, axis=0)
+      pre_maxima = safe_delete(pre_maxima, colocalized_synapse_indices, axis=0)
+      micro_maxima = safe_delete(micro_maxima, colocalized_synapse_indices, axis=0)
+      post_maxima = safe_delete(post_maxima, colocalized_synapse_indices, axis=0)
+
+# Step 6: Count double colocalizations
+    num_prepost = 0
+    prepost_indices = []
+    for i in range(len(pre_maxima)):
+      if i < len(pre_post_distances) and len(pre_post_distances[i]) > 0:
+        if np.min(pre_post_distances[i]) <= min_distance_prepost:
+            num_prepost += 1
+            prepost_indices.append(i)
+
+    if prepost_indices:
+      pre_maxima = safe_delete(pre_maxima, prepost_indices, axis=0)
+      post_maxima = safe_delete(post_maxima, prepost_indices, axis=0)
+
+    num_premicro = 0
+    premicro_indices = []
+    for i in range(len(pre_maxima)):
+        if i < len(pre_micro_distances) and np.min(pre_micro_distances[i]) <= min_distance_premicro:
+            num_premicro += 1
+            premicro_indices.append(i)
+    if premicro_indices:
+      micro_maxima = safe_delete(micro_maxima, premicro_indices, axis=0)
+      pre_maxima = safe_delete(post_maxima, premicro_indices, axis=0)
+    num_postmicro = 0
+    postmicro_indices = []
+    for i in range(len(micro_post_distances)):
+        if i < len(micro_post_distances) and len(micro_post_distances[i]) > 0:
+          if np.min(micro_post_distances[i]) <= min_distance_postmicro:
+            num_postmicro += 1
+            postmicro_indices.append(i)
+    if postmicro_indices:
+      micro_maxima = safe_delete(micro_maxima, postmicro_indices, axis=0)
+      post_maxima = safe_delete(post_maxima, postmicro_indices, axis=0)
+
+# Step 7: Count remaining single events
+    prelinked_maxima = label(pre_maxima)
+    num_pre = len(np.unique(prelinked_maxima))
+    microlinked_maxima = label(micro_maxima)
+    num_micro = len(np.unique(microlinked_maxima))
+    postlinked_maxima = label(post_maxima)
+    num_post = len(np.unique(postlinked_maxima))
+
+    return num_postmicro, num_premicro, num_prepost, num_pre, num_micro, num_post, num_colocalized_synapses
+
+def extract_well_number(filename):
+    return filename.split('_')[0]
+
+def extract_set_number(filename):
+    split_filename = filename.split('_')
+    if len(split_filename) >= 2:
+        return ''.join(filter(str.isdigit, split_filename[1]))
+    else:
+        return 'Unknown'
+
+def extract_label(filename):
+    return filename.split(' ')[1].split('.')[0]
+directory = '/content/drive/Othercomputers/My MacBook Air/Documents/PROJECT/images /P56 FMR1 CONTROL 09.04.24 BSN_HMR_IBA_AQP4/PROCESSED/MOUSE 3'
+image_files = os.listdir(directory)
+image_groups = {}
+for file in image_files:
+    well_number = extract_well_number(file)
+    set_number = extract_set_number(file)
+    if well_number not in image_groups:
+        image_groups[well_number] = {}
+    if set_number not in image_groups[well_number]:
+        image_groups[well_number][set_number] = []
+    image_groups[well_number][set_number].append(file)
+results = []
+for well_number, sets in image_groups.items():
+    for set_number, files in sets.items():
+        if len(files) == 3:
+            files.sort(key=extract_label)
+            presynaptic_img = imread(os.path.join(directory, files[2]))
+            microglial_img = imread(os.path.join(directory, files[0]))
+            postsynaptic_img = imread(os.path.join(directory, files[1]))
+            num_premicro, num_postmicro, num_prepost, num_pre, num_micro, num_post, num_colocalized_synapses = detect_synapses(presynaptic_img, microglial_img, postsynaptic_img)
+            well_set_combined = well_number + ' IMAGE' + set_number
+            results.append({
+                'Well': well_set_combined,
+                'BSN': num_pre,
+                'HMR': num_post,
+                'IBA': num_micro,
+                'BSN/HMR': num_prepost,
+                'BSN/IBA': num_premicro,
+                'HMR/IBA': num_postmicro,
+                'BSN/IBA/HMR': num_colocalized_synapses,
+            })
+results_df = pd.DataFrame(results)
+results_df['Total Synaptosomes'] = results_df[['BSN', 'HMR', 'BSN/IBA/HMR', 'HMR/IBA', 'BSN/IBA', 'BSN/HMR']].sum(axis=1)
+for col in ['BSN', 'HMR', 'BSN/IBA', 'HMR/IBA', 'BSN/HMR', 'BSN/IBA/HMR']:
+    results_df[f'%{col.split()[0]}'] = (results_df[col] / results_df['Total Synaptosomes']) * 100
+results_df = results_df.sort_values(by=['Well'])
+print(results_df)
+results_df.to_excel(output_pathway, index=False)
